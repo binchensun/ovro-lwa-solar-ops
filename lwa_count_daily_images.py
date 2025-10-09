@@ -8,6 +8,7 @@ import h5py
 from astropy.coordinates import SkyCoord, EarthLocation, get_body, AltAz
 from astropy.time import Time, TimeDelta
 import argparse
+import numpy as np
 
 CSV_FILE = './lwa_daily_image_counts_db.fch.csv'
 CSV_FILE_HOURLY = './lwa_hourly_image_counts_db.fch.csv'
@@ -195,13 +196,13 @@ def scan_pasthours(nhours=24, startdate=Time.now(), base_dir='/lustre/solarpipe/
         hour = timeplot.hour
         subdir = date.strftime("%Y/%m/%d/")
         filedir = base_dir + subdir
+        datestr = date.strftime("%Y-%m-%d")
+        datehrstr = '{0:s}T{1:02d}:00:00'.format(datestr,hour)
+        # calculate the number of files and images
+        file_count = 0  # Initialize counter for this subdirectory
+        image_count = 0
         if os.path.isdir(filedir):
-            datestr = date.strftime("%Y-%m-%d")
-            datehrstr = '{0:s}T{1:02d}:00:00'.format(datestr,hour)
             pattern = '*{0:s}*{1:s}T{2:02d}*.{3:s}'.format(filetype, datestr, hour, fileformat)
-            # calculate the number of files and images if fully operational
-            file_count = 0  # Initialize counter for this subdirectory
-            image_count = 0
             # Walk through the current subdirectory
             for root, dirs, files in os.walk(filedir):
                 # Check each file against the pattern
@@ -227,10 +228,10 @@ def scan_pasthours(nhours=24, startdate=Time.now(), base_dir='/lustre/solarpipe/
                             print(f"An unexpected error occurred for file {f}: {e}")
                             continue
 
-            data.append((datehrstr, file_count, image_count, nfile_hourly_th, nimage_hourly_th))
-            print(f"{datehrstr}: {file_count} files ({nfile_hourly_th} expected), {image_count} images ({nimage_hourly_th} expected)")
-            tot_file_count += file_count
-            tot_image_count += image_count
+        data.append((datehrstr, file_count, image_count, nfile_hourly_th, nimage_hourly_th))
+        print(f"{datehrstr}: {file_count} files ({nfile_hourly_th} expected), {image_count} images ({nimage_hourly_th} expected)")
+        tot_file_count += file_count
+        tot_image_count += image_count
 
     print(f'Total: {tot_file_count} files, {tot_image_count} images')
     if len(data) > 0:
@@ -326,8 +327,8 @@ def make_plot(ndays=10, alltime=True, figdir='/common/webplots/lwa-data/'):
         axs[0,0].set_ylim([0, 250])
         axs[0,0].legend(loc='upper left')
         ax2 = axs[0,0].twinx()
-        ax2.step(hours, (1.-df_hr["Hourly Images"]/df_hr["Hourly Files"]/144.)*100, where='mid', 
-                color='r', label='Chan Loss %') 
+        chanloss = (1.-df_hr["Hourly Images"]/df_hr["Hourly Files"]/144.)*100
+        ax2.step(hours, chanloss, where='mid', color='r', label='Chan Loss %') 
         ax2.set_ylim([0, 100])
         ax2.set_ylabel('Channel Loss Percentage')
         ax2.legend(loc='upper right')
@@ -424,8 +425,8 @@ def make_plot(ndays=10, alltime=True, figdir='/common/webplots/lwa-data/'):
         ax.set_ylim([0, 250])
         ax.legend(loc='upper left')
         ax2 = ax.twinx()
-        ax2.step(hours, (1.-df_hr["Hourly Images"]/df_hr["Hourly Files"]/144.)*100, where='mid', 
-                color='r', label='Chan Loss %') 
+        chanloss = (1.-df_hr["Hourly Images"]/df_hr["Hourly Files"]/144.)*100
+        ax2.step(hours, chanloss, where='mid', color='r', label='Chan Loss %') 
         ax2.set_ylim([0, 100])
         ax2.set_ylabel('Channel Loss Percentage')
         ax2.legend(loc='upper right')
