@@ -161,7 +161,8 @@ def check_fast_ms(msname):
 def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_phase_cal=0, slowfast='slow',
                 num_apcal=1, caltable_folder=None, logger_file=None, visdir_slfcaled=None, 
                 refant='283',
-                flagdir=None, delete_allsky=False, actively_rm_ms=True, stokes='I', manual_flagging_ants=None):
+                flagdir=None, delete_allsky=False, actively_rm_ms=True, stokes='I', manual_flagging_ants=None,
+                average_fast=True):
     
     try:
         msmd.open(msfile)
@@ -170,7 +171,7 @@ def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_p
         return -1
 
     # do time average if the input ms file is fast visibility
-    if slowfast == 'fast':
+    if slowfast == 'fast' and average_fast:
         if check_fast_ms(msfile):
             omsfile = os.path.dirname(msfile) + '/' + os.path.basename(msfile).replace('.ms', '.10s.ms')
             split(msfile, omsfile, datacolumn='data', timebin='10s')
@@ -897,7 +898,7 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
             refant='283',
             calib_file = '20240117_145752',
             delete_working_ms=True, delete_working_fits=True, do_refra=True, overbright=2e6, save_selfcaltab=False,
-            slowfast='slow', do_imaging=True, delete_allsky=False, save_allsky=False,
+            slowfast='slow', do_imaging=True, delete_allsky=False, save_allsky=False, average_fast=True,
             bands = ['32MHz', '36MHz', '41MHz', '46MHz', '50MHz', '55MHz', '59MHz', '64MHz', '69MHz', '73MHz', '78MHz', '82MHz'],
             clear_old_files=True, clear_older_than=45, actively_rm_ms=True, leakage_database='/lustre/msurajit/leakage_database.db'):
     """
@@ -1140,7 +1141,7 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
                     refant=refant,
                     num_phase_cal=num_phase_cal, num_apcal=num_apcal, logger_file=logger_file, caltable_folder=gaintable_folder, 
                     visdir_slfcaled=visdir_slfcaled, flagdir=flagdir, delete_allsky=delete_allsky, actively_rm_ms=actively_rm_ms,
-                    stokes=stokes)
+                    stokes=stokes, slowfast=slowfast, average_fast=average_fast)
 
             if slowfast.lower()=='slow':
                 timeout = 800.
@@ -1685,7 +1686,8 @@ def remove_old_items(directory=".", minutes=45):
         
 
 def run_pipeline(time_start=Time.now(), time_end=None, time_interval=600., delay_from_now=180., do_selfcal=True, num_phase_cal=1, num_apcal=0, 
-        server=None, lustre=True, file_path='slow', multinode=True, slurmmanaged=True, taskids='0123456789', delete_ms_slfcaled=True, slowfast='slow', 
+        server=None, lustre=True, file_path='slow', multinode=True, slurmmanaged=True, taskids='0123456789', delete_ms_slfcaled=True, 
+        slowfast='slow', average_fast=True,
         logger_dir = '/lustre/solarpipe/realtime_pipeline/logs/', logger_prefix='solar_realtime_pipeline', logger_level=20,
         #proc_dir = '/fast/solarpipe/realtime_pipeline/',
         proc_dir_mem = '/dev/shm/srtmp/', proc_dir = '/fast/solarpipe/realtime_pipeline/',
@@ -1859,7 +1861,7 @@ def run_pipeline(time_start=Time.now(), time_end=None, time_interval=600., delay
         # do one round of cleaning up old files before pipeline_quick
         
         res = pipeline_quick(time_start, do_selfcal=do_selfcal, num_phase_cal=num_phase_cal, num_apcal=num_apcal, 
-                            server=server, lustre=lustre, file_path=file_path, slowfast=slowfast, delete_ms_slfcaled=delete_ms_slfcaled,
+                            server=server, lustre=lustre, file_path=file_path, slowfast=slowfast, average_fast=average_fast, delete_ms_slfcaled=delete_ms_slfcaled,
                             logger_file=logger_file, proc_dir=proc_dir,  proc_dir_mem=proc_dir_mem, save_dir=save_dir, calib_dir=calib_dir, 
                             calib_file=calib_file, delete_working_ms=delete_working_ms,
                             delete_working_fits=delete_working_fits, do_refra=do_refra,
@@ -1992,6 +1994,7 @@ if __name__=='__main__':
     parser.add_argument('--nonstop', default=False, help='If set, the script will be run without stopping', action='store_true')
     parser.add_argument('--sleep_time', default=0.0, help='Process will sleep for these seconds before doing anything')
     parser.add_argument('--slowfast', default='slow', help='Specify slow or fast visibility data to be processed')
+    parser.add_argument('--average_fast', default=True, help='Whether or not average fast visibility to 10 s')
     parser.add_argument('--bands', '--item', action='store', dest='bands',
                     type=str, nargs='*', 
                     default=['32MHz', '36MHz', '41MHz', '46MHz', '50MHz', '55MHz', '59MHz', '64MHz', '69MHz', '73MHz', '78MHz', '82MHz'],
@@ -2035,7 +2038,8 @@ if __name__=='__main__':
             altitude_limit=float(args.alt_limit), logger_dir = args.logger_dir, logger_prefix=args.logger_prefix, logger_level=int(args.logger_level), 
             do_refra=args.do_refra, multinode= (not args.singlenode), delete_working_ms=(not args.keep_working_ms), 
             delete_working_fits=(not args.keep_working_fits), save_allsky=args.save_allsky, beam_fit_size=args.bmfit_sz, briggs=args.briggs,
-            do_selfcal=do_selfcal, do_imaging=(not args.no_imaging), bands=args.bands, slowfast=args.slowfast, stop_at_sunset=(not args.nonstop),
+            do_selfcal=do_selfcal, do_imaging=(not args.no_imaging), bands=args.bands, slowfast=args.slowfast, average_fast=args.average_fast, 
+            stop_at_sunset=(not args.nonstop),
             do_daily_refracorr=(not args.no_refracorr), slurm_kill_after_sunset=args.slurm_kill_after_sunset, 
             save_selfcaltab=args.save_selfcaltab, actively_rm_ms=(not args.no_actively_rm_ms), use_jpl_ephem=args.use_jpl_ephem, stokes=args.stokes)
     except Exception as e:
