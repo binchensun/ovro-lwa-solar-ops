@@ -367,7 +367,13 @@ def run_imager(msfile_slfcaled, imagedir_allch=None, ephem=None, nch_out=12,
                     intervals_out, cadence
                 )
             )
-            default_wscleancmd += " -intervals-out " + str(intervals_out)
+            # Fast visibility integrations are stored as separate CASA fields.
+            # Without ``-field all``, WSClean images only the first integration
+            # and writes empty products for the remaining output intervals.
+            default_wscleancmd += (
+                " -field all"
+                " -intervals-out " + str(intervals_out)
+            )
 
         if nch_out>1:
             # default to be used for slow visibility imaging for fine channel imaging
@@ -387,11 +393,45 @@ def run_imager(msfile_slfcaled, imagedir_allch=None, ephem=None, nch_out=12,
             #else:
             outfits_helio = []
             for outfit in outfits:
-                # single fits conversion
-                outfits_helio.append(ocoords.fitsj2000tohelio(outfit, out_fits=None, toK=True, verbose=False,\
-                                         sclfactor=sclfactor, subregion=[blc, trc, blc, trc]))
+                try:
+                    header = fits.getheader(outfit)
+                    nvis = header.get('WSCNVIS')
+                    bmaj = header.get('BMAJ', 0.)
+                    bmin = header.get('BMIN', 0.)
+                    freq = header.get('CRVAL3', 0.)
+                    if ((nvis is not None and nvis <= 0) or
+                            bmaj <= 0 or bmin <= 0 or freq <= 0):
+                        logging.warning(
+                            'Skipping empty or invalid WSClean image %s '
+                            '(WSCNVIS=%s, BMAJ=%s, BMIN=%s, CRVAL3=%s)',
+                            outfit, nvis, bmaj, bmin, freq,
+                        )
+                        continue
+
+                    # single FITS conversion
+                    outfit_helio = ocoords.fitsj2000tohelio(
+                        outfit,
+                        out_fits=None,
+                        toK=True,
+                        verbose=False,
+                        sclfactor=sclfactor,
+                        subregion=[blc, trc, blc, trc],
+                    )
+                    if outfit_helio is not None:
+                        outfits_helio.append(outfit_helio)
+                except Exception:
+                    logging.exception(
+                        'Failed to convert WSClean image %s to helioprojective FITS',
+                        outfit,
+                    )
             #outfits_helio = ocoords.fitsj2000tohelio(outfits, out_fits=None, reftime="", toK=True, verbose=False, sclfactor=sclfactor)
-            return outfits_helio
+            if outfits_helio:
+                return outfits_helio
+            logging.error(
+                'No valid WSClean images were available for conversion from %s.',
+                msfile_slfcaled,
+            )
+            return -1
         else:
             logging.error('No fits images produced.')
             return -1
@@ -1566,7 +1606,21 @@ def image_times(msfiles_slfcaled, imagedir_allch, nch_out=12, stokes='I',
 
     timeout = 1800. if per_integration else 300.
     
-    fitsfiles=parallel_task_runner(run_imager_partial,msfiles_slfcaled_success,timeout=timeout)
+    imaging_results = parallel_task_runner(
+        run_imager_partial,
+        msfiles_slfcaled_success,
+        timeout=timeout,
+    )
+    fitsfiles = [
+        result for result in imaging_results
+        if isinstance(result, list) and len(result) > 0
+    ]
+    failed_count = len(msfiles_slfcaled_success) - len(fitsfiles)
+    if failed_count:
+        logging.error(
+            'Imaging failed or produced no valid FITS files for %d band(s).',
+            failed_count,
+        )
     if len(fitsfiles)==len(msfiles_slfcaled_success):
         time_img2 = timeit.default_timer()
         logging.debug('Imaging for all {0:d} bands is done in {1:.1f} s'.format(len(msfiles_slfcaled_success), time_img2-time_img1))
