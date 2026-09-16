@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import os, sys, glob
+import re
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -48,6 +49,9 @@ msmd = msmetadata()
 qa = quanta()
 me = measures()
 tb = table()
+
+FAST_VIS_NATIVE_CADENCE_S = 0.1
+WSCLEAN_TIME_INDEX_RE = re.compile(r'-t(\d+)-')
 
 def get_memory():
     with open('/proc/meminfo', 'r') as mem:
@@ -156,6 +160,30 @@ def check_fast_ms(msname):
     if num_ants>50:
         return False
     return True
+
+
+def get_ms_integration_times(msfile):
+    """Return the unique integration-center times from a measurement set."""
+    local_tb = table()
+    local_tb.open(msfile)
+    try:
+        unique_times = np.unique(local_tb.getcol('TIME'))
+    finally:
+        local_tb.close()
+
+    return Time(unique_times / 86400.0, format='mjd', scale='utc')
+
+
+def get_ms_time_info(msfile):
+    """Return the number of unique integrations and their median cadence."""
+    integration_times = get_ms_integration_times(msfile)
+
+    if len(integration_times) > 1:
+        cadence = float(np.median(np.diff(integration_times.mjd)) * 86400.0)
+    else:
+        cadence = None
+
+    return len(integration_times), cadence
 
 
 def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_phase_cal=0, slowfast='slow',
@@ -271,7 +299,9 @@ def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_p
         return -1
 
 
-def run_imager(msfile_slfcaled, imagedir_allch=None, ephem=None, nch_out=12, stokes='I', beam_fit_size=2, briggs=-0.5,use_jpl_ephem=False):
+def run_imager(msfile_slfcaled, imagedir_allch=None, ephem=None, nch_out=12,
+               stokes='I', beam_fit_size=2, briggs=-0.5,
+               use_jpl_ephem=False, per_integration=False):
     blc = int(512 - 128)
     trc = int(512 + 128)
     region='box [ [ {0:d}pix , {1:d}pix] , [{2:d}pix, {3:d}pix ] ]'.format(blc, blc, trc, trc)
@@ -305,7 +335,39 @@ def run_imager(msfile_slfcaled, imagedir_allch=None, ephem=None, nch_out=12, sto
 
         logging.info('Imaging {0:s} with {1:s} (nch_out: {2:d})'.format(msfile_slfcaled, helio_imagename, nch_out))
         
-        default_wscleancmd = "wsclean -j 2 -mem 4 -quiet -no-reorder -no-dirty -no-update-model-required -horizon-mask 5deg -size 1024 1024 -scale 1.5arcmin -weight briggs " + str(briggs) + " -minuv-l 10 -auto-threshold 3 -name " + helio_imagename + " -niter 10000 -mgain 0.8 -beam-fitting-size " + str(beam_fit_size) + " -pol " + stokes
+        default_wscleancmd = (
+            "wsclean "
+            "-j 2 "
+            "-mem 4 "
+            "-quiet "
+            "-no-reorder "
+            "-no-dirty "
+            "-no-update-model-required "
+            "-horizon-mask 5deg "
+            "-size 1024 1024 "
+            "-scale 1.5arcmin "
+            f"-weight briggs {briggs} "
+            "-minuv-l 10 "
+            "-auto-threshold 3 "
+            f"-name {helio_imagename} "
+            "-niter 10000 "
+            "-mgain 0.8 "
+            f"-beam-fitting-size {beam_fit_size} "
+            f"-pol {stokes}"
+        )
+
+        if per_integration:
+            intervals_out, cadence = get_ms_time_info(msfile_slfcaled)
+            if intervals_out < 1:
+                raise RuntimeError(
+                    'No integrations found in {0:s}'.format(msfile_slfcaled)
+                )
+            logging.info(
+                'Imaging {0:d} integrations separately (median cadence: {1})'.format(
+                    intervals_out, cadence
+                )
+            )
+            default_wscleancmd += " -intervals-out " + str(intervals_out)
 
         if nch_out>1:
             # default to be used for slow visibility imaging for fine channel imaging
@@ -335,9 +397,7 @@ def run_imager(msfile_slfcaled, imagedir_allch=None, ephem=None, nch_out=12, sto
             return -1
     except Exception as e:
         print(e)
-        logging.error(e)
-        if wsclean_proc.poll() is None:
-            wsclean_proc.terminate()
+        logging.exception(e)
         return -1
 
 
@@ -928,6 +988,8 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
     :param delete_working_ms: if True, delete the working ms files after imaging (set False for debugging purpose)
     :param overbright: peak brightness temperature exceeding this value (in Kelvin) will be excluded for refraction correction fitting
     :param slowfast: specify whether slow or fast visibilities are being processed
+    :param average_fast: average fast visibilities to 10 s when True; when
+        False, preserve and image each native 0.1 s integration
     :param delete_allsky: if True, delete the allsky image after each run. Otherwise keep the latest frame. 
     :param save_allsky: if True, save the allsky image FITS file into save_dir + 'allsky/'
     """
@@ -1240,10 +1302,21 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
 
 
             if do_imaging:
-                #if fast_vis:
-                #    nch_out=1
-                fitsfiles, badants_arr = image_times(msfiles_slfcaled,imagedir_allch, nch_out=nch_out, \
-                                   stokes=stokes, beam_fit_size=beam_fit_size, briggs=briggs)
+                per_integration = fast_vis and not average_fast
+                integration_times = None
+                if per_integration:
+                    integration_times = get_ms_integration_times(
+                        msfiles_slfcaled_success[0]
+                    )
+                fitsfiles, badants_arr = image_times(
+                    msfiles_slfcaled,
+                    imagedir_allch,
+                    nch_out=nch_out,
+                    stokes=stokes,
+                    beam_fit_size=beam_fit_size,
+                    briggs=briggs,
+                    per_integration=per_integration,
+                )
             btime = Time(trange['begin']['m0']['value'], format='mjd')
 
 
@@ -1309,6 +1382,34 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
                         os.makedirs(fig_mfs_dir_sub_synop)
                     
                     fitsfiles.sort()
+                    if fast_vis and not average_fast:
+                        wrapped_fitsfiles = wrap_fast_per_integration_images(
+                            fitsfiles,
+                            imagedir_allch_combined,
+                            hdf_dir,
+                            fig_mfs_dir,
+                            stokes,
+                            calib_file,
+                            badants_arr=badants_arr,
+                            integration_times=integration_times,
+                        )
+                        logging.info(
+                            'Created {0:d} native-cadence fast FITS products'.format(
+                                len(wrapped_fitsfiles)
+                            )
+                        )
+                        if delete_working_fits:
+                            os.system('rm -rf '+imagedir_allch + '*')
+                        time_completed = timeit.default_timer()
+                        logging.debug(
+                            '====All native-cadence processing for time {0:s} '
+                            'is done in {1:.1f} minutes'.format(
+                                timestr,
+                                (time_completed-time_begin)/60.,
+                            )
+                        )
+                        return True
+
                     if stokes!='I':
                         allstokes_fits=combine_pol_images(fitsfiles,stokes)
                         #for fitsimages in allstokes_fits: 
@@ -1431,7 +1532,8 @@ def parallel_task_runner(function_name,input_list,timeout=86400):
         
             
 
-def image_times(msfiles_slfcaled, imagedir_allch, nch_out=12, stokes='I', beam_fit_size=2, briggs=-0.5):
+def image_times(msfiles_slfcaled, imagedir_allch, nch_out=12, stokes='I',
+                beam_fit_size=2, briggs=-0.5, per_integration=False):
     msfiles_slfcaled_success = []
     for m in msfiles_slfcaled:
         if type(m) is str:
@@ -1451,10 +1553,18 @@ def image_times(msfiles_slfcaled, imagedir_allch, nch_out=12, stokes='I', beam_f
     # ephem = hf.read_horizons(tref, dur=1./60./24., observatory='OVRO_MMA')
     ephem=None
 
-    run_imager_partial = partial(run_imager, imagedir_allch=imagedir_allch, ephem=ephem, \
-                nch_out=nch_out, stokes=stokes, beam_fit_size=beam_fit_size, briggs=briggs)
+    run_imager_partial = partial(
+        run_imager,
+        imagedir_allch=imagedir_allch,
+        ephem=ephem,
+        nch_out=nch_out,
+        stokes=stokes,
+        beam_fit_size=beam_fit_size,
+        briggs=briggs,
+        per_integration=per_integration,
+    )
 
-    timeout = 300.
+    timeout = 1800. if per_integration else 300.
     
     fitsfiles=parallel_task_runner(run_imager_partial,msfiles_slfcaled_success,timeout=timeout)
     if len(fitsfiles)==len(msfiles_slfcaled_success):
@@ -1471,6 +1581,47 @@ def image_times(msfiles_slfcaled, imagedir_allch, nch_out=12, stokes='I', beam_f
             badants_arr.append(N_badants)
     
     return fitsfiles, badants_arr
+
+
+def group_wsclean_images_by_interval(fitsfiles):
+    """Group per-band WSClean products by their ``t####`` time index."""
+    grouped = {}
+
+    for band_images in fitsfiles:
+        if not isinstance(band_images, list):
+            continue
+
+        band_groups = {}
+        for image in band_images:
+            match = WSCLEAN_TIME_INDEX_RE.search(os.path.basename(image))
+            if match is None:
+                continue
+            interval_index = int(match.group(1))
+            band_groups.setdefault(interval_index, []).append(image)
+
+        for interval_index, interval_images in band_groups.items():
+            grouped.setdefault(interval_index, []).append(
+                sorted(interval_images)
+            )
+
+    return dict(sorted(grouped.items()))
+
+
+def get_interval_obstime(interval_fitsfiles):
+    """Read an integration timestamp from one WSClean FITS product."""
+    for band_images in interval_fitsfiles:
+        if not isinstance(band_images, list):
+            continue
+        mfs_images = [f for f in band_images if 'MFS' in os.path.basename(f)]
+        candidates = mfs_images or band_images
+        for image in candidates:
+            header = fits.getheader(image)
+            date_obs = header.get('DATE-OBS')
+            if date_obs:
+                return Time(date_obs)
+
+    raise RuntimeError('No DATE-OBS found for WSClean integration')
+
 
 def combine_pol_images(fitsfiles,stokes):
     num_freqs=len(fitsfiles)
@@ -1530,8 +1681,24 @@ def add_caltb_header(fits_images,calib_file):
 
 
             
+def cadence_label(cadence_seconds):
+    if cadence_seconds < 1.0:
+        return '{0:d}ms'.format(int(round(cadence_seconds * 1000.0)))
+    if float(cadence_seconds).is_integer():
+        return '{0:d}s'.format(int(cadence_seconds))
+    return '{0:g}s'.format(cadence_seconds)
+
+
+def format_obstime_for_filename(obstime, cadence_seconds):
+    output_time = Time(obstime)
+    output_time.precision = 3 if cadence_seconds < 1.0 else 0
+    return output_time.isot.replace(':', '') + 'Z'
+
+
 def compress_plot_images(fitsfiles, starttime, datedir, imagedir_allch_combined, \
-                            hdf_dir, fig_mfs_dir, stokes, fast_vis=False, badants_arr=None):    
+                            hdf_dir, fig_mfs_dir, stokes, fast_vis=False,
+                            badants_arr=None, cadence_seconds=10.0,
+                            make_plot=True):
                             
 
     if fast_vis:
@@ -1553,20 +1720,20 @@ def compress_plot_images(fitsfiles, starttime, datedir, imagedir_allch_combined,
         os.makedirs(fig_mfs_dir_sub_lv10)
     
     ## Wrap images
-    timestr_iso = btime.isot[:-4].replace(':','')+'Z'
+    timestr_iso = format_obstime_for_filename(btime, cadence_seconds)
+    cadence_str = cadence_label(cadence_seconds)
     
     # multi-frequency synthesis images
-    fits_mfs = imagedir_allch_combined_sub_lv10 + '/' + imagename_pre + '.lev1_mfs_10s.' + \
+    fits_mfs = imagedir_allch_combined_sub_lv10 + '/' + imagename_pre + '.lev1_mfs_' + cadence_str + '.' + \
                 timestr_iso + '.image_'+stokes.replace(',','')+'.fits' 
     #fitsfiles_mfs = glob.glob(imagedir_allch + '/' + timestr+ '*MFS-image.fits')
     fitsfiles_mfs = []
     for f in fitsfiles:
         if type(f) is list:
-            #if 'MFS' in f[-1] and (not fast_vis):
-            if 'MFS' in f[-1]:
-                fitsfiles_mfs.append(f[-1])
-            #elif fast_vis:
-            #    fitsfiles_mfs+=f
+            fitsfiles_mfs += [
+                image for image in f
+                if 'MFS' in os.path.basename(image)
+            ]
              
         else:
             continue
@@ -1579,31 +1746,99 @@ def compress_plot_images(fitsfiles, starttime, datedir, imagedir_allch_combined,
     
     #if not fast_vis:
     # fine channel spectral images
-    fits_fch = imagedir_allch_combined_sub_lv10 + '/' + imagename_pre + '.lev1_fch_10s.' + \
+    fits_fch = imagedir_allch_combined_sub_lv10 + '/' + imagename_pre + '.lev1_fch_' + cadence_str + '.' + \
                     timestr_iso + '.image_'+stokes.replace(',','')+'.fits' 
     fitsfiles_fch = []
     for f in fitsfiles:
         if type(f) is list:
-            fitsfiles_fch += f[:-1]
+            fitsfiles_fch += [
+                image for image in f
+                if 'MFS' not in os.path.basename(image)
+            ]
         else:
             continue
     fitsfiles_fch.sort()
     ndfits.wrap(fitsfiles_fch, outfitsfile=fits_fch)
     
-    if badants_arr is not None:
-        with fits.open(fits_mfs, mode='update') as hdul:
-            hdul[0].header['N_BADANTS'] = str(badants_arr)
+    for output_fits in (fits_mfs, fits_fch):
+        with fits.open(output_fits, mode='update') as hdul:
+            hdul[0].header['CADENCE'] = (
+                cadence_seconds,
+                'Image cadence in seconds',
+            )
+            hdul[0].header['EXPTIME'] = (
+                cadence_seconds,
+                'Integration time in seconds',
+            )
+            if badants_arr is not None:
+                hdul[0].header['N_BADANTS'] = str(badants_arr)
             hdul.flush()
-            
-    fig, axes = ovis.slow_pipeline_default_plot(fits_mfs,apply_fiducial_primary_beam=True,badants_arr=badants_arr)
-    figname_lv10 = os.path.basename(fits_mfs).replace('.fits', '.png')
-    fig.savefig(fig_mfs_dir_sub_lv10 + '/' + figname_lv10)
+
+    plotted_image = None
+    if make_plot:
+        fig, axes = ovis.slow_pipeline_default_plot(
+            fits_mfs,
+            apply_fiducial_primary_beam=True,
+            badants_arr=badants_arr,
+        )
+        figname_lv10 = os.path.basename(fits_mfs).replace('.fits', '.png')
+        plotted_image = fig_mfs_dir_sub_lv10 + '/' + figname_lv10
+        fig.savefig(plotted_image)
     
     #if not fast_vis:
-    return [fits_mfs, fits_fch], os.path.join(fig_mfs_dir_sub_lv10, figname_lv10)
+    return [fits_mfs, fits_fch], plotted_image
     #else:
     #    return [fits_mfs], os.path.join(fig_mfs_dir_sub_lv10, figname_lv10)
-    
+
+
+def wrap_fast_per_integration_images(
+        fitsfiles, imagedir_allch_combined, hdf_dir, fig_mfs_dir, stokes,
+        calib_file, badants_arr=None, integration_times=None,
+        cadence_seconds=FAST_VIS_NATIVE_CADENCE_S):
+    """Wrap WSClean snapshots into one MFS and one FCH FITS per integration."""
+    grouped_fitsfiles = group_wsclean_images_by_interval(fitsfiles)
+    if not grouped_fitsfiles:
+        raise RuntimeError('No per-integration WSClean products were found')
+
+    wrapped_fitsfiles = []
+    for interval_index, interval_fitsfiles in grouped_fitsfiles.items():
+        if stokes != 'I':
+            interval_fitsfiles = combine_pol_images(
+                interval_fitsfiles,
+                stokes,
+            )
+
+        if integration_times is not None and interval_index < len(integration_times):
+            interval_time = integration_times[interval_index]
+        else:
+            interval_time = get_interval_obstime(interval_fitsfiles)
+        datedir = interval_time.isot[:10].replace('-', '/') + '/'
+        logging.info(
+            'Wrapping fast integration t{0:04d} at {1:s}'.format(
+                interval_index,
+                interval_time.isot,
+            )
+        )
+
+        interval_products, _ = compress_plot_images(
+            interval_fitsfiles,
+            interval_time,
+            datedir,
+            imagedir_allch_combined,
+            hdf_dir,
+            fig_mfs_dir,
+            stokes,
+            fast_vis=True,
+            badants_arr=badants_arr,
+            cadence_seconds=cadence_seconds,
+            make_plot=False,
+        )
+        add_caltb_header(interval_products, calib_file)
+        wrapped_fitsfiles.extend(interval_products)
+
+    return wrapped_fitsfiles
+
+
 def do_refraction_correction(fitsfiles, overbright, refrafile, datedir, imagedir_allch_combined, hdf_dir, \
                             fig_mfs_dir, image_time, badants_arr=None):
     btime=image_time                        
@@ -1719,6 +1954,8 @@ def run_pipeline(time_start=Time.now(), time_end=None, time_interval=600., delay
     :param lustre: if True, specific to lustre system on lwacalim nodes. If not, try your luck in combination with file_path
     :param file_path: path to the data w.r.t. the server
     :param slowfast: specify slow or fast visibility data to process
+    :param average_fast: average fast visibilities to 10 s when True; when
+        False, preserve and image each native 0.1 s integration
     :param delay_from_now: delay of the newest time to process compared to now.
     :param delete_ms_slfcaled: whether or not to delete the self-calibrated measurement sets.
     :param multinode: if True, will delay the start time by the node
@@ -1994,7 +2231,20 @@ if __name__=='__main__':
     parser.add_argument('--nonstop', default=False, help='If set, the script will be run without stopping', action='store_true')
     parser.add_argument('--sleep_time', default=0.0, help='Process will sleep for these seconds before doing anything')
     parser.add_argument('--slowfast', default='slow', help='Specify slow or fast visibility data to be processed')
-    parser.add_argument('--average_fast', default=True, help='Whether or not average fast visibility to 10 s')
+    average_fast_group = parser.add_mutually_exclusive_group()
+    average_fast_group.add_argument(
+        '--average_fast',
+        dest='average_fast',
+        action='store_true',
+        help='Average fast visibility data to 10 s before imaging (default)',
+    )
+    average_fast_group.add_argument(
+        '--no_average_fast',
+        dest='average_fast',
+        action='store_false',
+        help='Keep 0.1 s fast visibilities and image every integration',
+    )
+    parser.set_defaults(average_fast=True)
     parser.add_argument('--bands', '--item', action='store', dest='bands',
                     type=str, nargs='*', 
                     default=['32MHz', '36MHz', '41MHz', '46MHz', '50MHz', '55MHz', '59MHz', '64MHz', '69MHz', '73MHz', '78MHz', '82MHz'],
@@ -2045,6 +2295,3 @@ if __name__=='__main__':
     except Exception as e:
         logging.error(e)
         raise e
-
-
-

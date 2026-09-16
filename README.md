@@ -64,6 +64,29 @@ sbatch runSlurm_solarPipeline.sh testslowfixedtime \
  "2024-09-15T20:00:00"  "2024-09-15T21:00:00" 
 ```
 
+## Native-cadence fast imaging
+
+Fast visibility data are averaged to 10 seconds by default. To preserve the
+native 0.1-second integrations and make one image set per integration, run the
+pipeline with:
+
+```bash
+python solar_realtime_pipeline.py \
+  --slowfast fast \
+  --no_average_fast \
+  --file_path /path/to/fast/
+```
+
+The pipeline passes the number of native integrations to WSClean through
+`-intervals-out`, groups the resulting `t####` products by time, and writes one
+MFS and one fine-channel FITS product for every 0.1-second integration. Output
+names include the cadence and millisecond timestamp, for example:
+
+```text
+ovro-lwa-48.lev1_mfs_100ms.2024-02-15T190100.100Z.image_I.fits
+ovro-lwa-48.lev1_fch_100ms.2024-02-15T190100.100Z.image_I.fits
+```
+
 
 # Alignment to sunrise time
 
@@ -93,4 +116,3 @@ import beam_scheduling_sdf as bss
 # Generate solar SDF for 7 days
 bss.make_solar_sdf(ndays=7)
 ```
-
