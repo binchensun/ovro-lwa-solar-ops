@@ -87,6 +87,79 @@ ovro-lwa-48.lev1_mfs_100ms.2024-02-15T190100.100Z.image_I.fits
 ovro-lwa-48.lev1_fch_100ms.2024-02-15T190100.100Z.image_I.fits
 ```
 
+## Offline slow products for fast imaging
+
+Realtime processing keeps only the most recent slow-visibility calibration and
+all-sky products in its temporary working directories. This rolling-cache
+behavior remains the default.
+
+For offline processing, the pipeline can instead save every successfully imaged
+slow timestamp to a persistent directory. Enable this behavior with
+`--operation_mode offline`, provide `--slow_products_dir`, and request both the
+all-sky products and self-calibration tables:
+
+```bash
+python solar_realtime_pipeline.py \
+  --operation_mode offline \
+  --slowfast slow \
+  --save_allsky \
+  --save_selfcaltab \
+  --slow_products_dir /lustre/bin.chen/20240215_typeJ/slow_products \
+  --file_path /lustre/bin.chen/20240215_typeJ/slow/ \
+  --nolustre \
+  --start_time 2024-02-15T19:01:00 \
+  --end_time 2024-02-15T19:06:00
+```
+
+When persistent slow archiving is enabled, `--save_allsky` and
+`--save_selfcaltab` must be supplied together so every completed bundle is
+usable by the fast pipeline.
+
+Each timestamp is copied only after its imaging step succeeds. A completed
+bundle has the following layout:
+
+```text
+/lustre/bin.chen/20240215_typeJ/slow_products/
+└── 2024/02/15/20240215_190150/
+    ├── allsky/
+    │   ├── 20240215_190150_23MHz..._allsky-image.fits
+    │   ├── 20240215_190150_23MHz..._allsky-model.fits
+    │   └── ...
+    ├── caltables/
+    │   ├── 20240215_190150_23MHz....gcal/
+    │   └── ...
+    └── COMPLETE
+```
+
+The temporary bundle is renamed into place only after all requested files have
+been copied. Existing completed bundles are not overwritten.
+
+Use the same directory when processing fast visibilities offline:
+
+```bash
+python solar_realtime_pipeline.py \
+  --operation_mode offline \
+  --slowfast fast \
+  --no_average_fast \
+  --slow_products_dir /lustre/bin.chen/20240215_typeJ/slow_products \
+  --slow_products_warn_seconds 10 \
+  --file_path /lustre/bin.chen/20240215_typeJ/fast/ \
+  --nolustre \
+  --start_time 2024-02-15T19:01:50 \
+  --end_time 2024-02-15T19:01:59
+```
+
+For each frequency band, fast processing selects the nearest completed bundle
+that contains both its self-calibration tables and its all-sky image/model
+files. The selected products are copied to a disposable working directory so
+the archive remains unchanged. A warning is logged when the selected slow and
+fast timestamps differ by more than `--slow_products_warn_seconds`; processing
+continues with the nearest products.
+
+If `--operation_mode offline` is used without `--slow_products_dir`, the
+pipeline logs a warning and falls back to the existing realtime rolling-cache
+behavior for both slow and fast processing.
+
 
 # Alignment to sunrise time
 

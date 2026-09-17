@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 import os, sys, glob
 import re
+import shutil
+import tempfile
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -52,6 +54,8 @@ tb = table()
 
 FAST_VIS_NATIVE_CADENCE_S = 0.1
 WSCLEAN_TIME_INDEX_RE = re.compile(r'-t(\d+)-')
+OFFLINE_SLOW_BUNDLE_RE = re.compile(r'^\d{8}_\d{6}$')
+OFFLINE_SLOW_COMPLETE_MARKER = 'COMPLETE'
 
 def get_memory():
     with open('/proc/meminfo', 'r') as mem:
@@ -148,6 +152,207 @@ def get_allsky_image_to_use(msname, img_folder):
     img_time = utils.get_selfcal_time_to_apply(msname, imgs) ## function matches time str only. Hence can be used here
     imgs = glob.glob(img_folder + "/" + img_time + "*" + msfreq_str + "*allsky-image.fits")
     return imgs
+
+
+def offline_slow_products_enabled(operation_mode, slow_products_dir):
+    """Return True when the persistent offline slow-product store is enabled."""
+    return operation_mode.lower() == 'offline' and bool(slow_products_dir)
+
+
+def get_offline_slow_bundle_dir(slow_products_dir, timestr):
+    """Return the persistent bundle directory for a YYYYMMDD_HHMMSS timestamp."""
+    return os.path.join(
+        slow_products_dir,
+        timestr[0:4],
+        timestr[4:6],
+        timestr[6:8],
+        timestr,
+    )
+
+
+def archive_offline_slow_products(timestr, gaintable_folder, visdir_work,
+                                  slow_products_dir, save_selfcaltab=True,
+                                  save_allsky=True):
+    """Persist one completed slow-imaging cycle without altering the rolling cache."""
+    bundle_dir = get_offline_slow_bundle_dir(slow_products_dir, timestr)
+    complete_marker = os.path.join(bundle_dir, OFFLINE_SLOW_COMPLETE_MARKER)
+    if os.path.isfile(complete_marker):
+        logging.info('Offline slow-product bundle already exists; not overwriting %s', bundle_dir)
+        return True
+
+    caltables = []
+    if save_selfcaltab:
+        caltables = sorted(glob.glob(os.path.join(
+            gaintable_folder, timestr + '_*MHz*.gcal'
+        )))
+        caltables = [path for path in caltables if not path.endswith('.fast')]
+        if not caltables:
+            logging.error('No self-calibration tables found for offline bundle %s', timestr)
+            return False
+
+    allsky_files = []
+    if save_allsky:
+        allsky_files = sorted(glob.glob(os.path.join(
+            visdir_work, timestr + '_*MHz*_allsky*.fits'
+        )))
+        if not allsky_files:
+            logging.error('No all-sky FITS products found for offline bundle %s', timestr)
+            return False
+
+    parent_dir = os.path.dirname(bundle_dir)
+    os.makedirs(parent_dir, exist_ok=True)
+    staging_dir = tempfile.mkdtemp(
+        prefix=os.path.basename(bundle_dir) + '.tmp-',
+        dir=parent_dir,
+    )
+    try:
+        if caltables:
+            caltable_dir = os.path.join(staging_dir, 'caltables')
+            os.makedirs(caltable_dir)
+            for caltable in caltables:
+                shutil.copytree(
+                    caltable,
+                    os.path.join(caltable_dir, os.path.basename(caltable)),
+                )
+
+        if allsky_files:
+            allsky_dir = os.path.join(staging_dir, 'allsky')
+            os.makedirs(allsky_dir)
+            for allsky_file in allsky_files:
+                shutil.copy2(allsky_file, allsky_dir)
+
+        with open(os.path.join(staging_dir, OFFLINE_SLOW_COMPLETE_MARKER), 'w') as marker:
+            marker.write(
+                'timestamp={0}\ncaltables={1}\nallsky_files={2}\n'.format(
+                    timestr, len(caltables), len(allsky_files)
+                )
+            )
+
+        if os.path.exists(bundle_dir):
+            logging.warning('Offline bundle path exists but is incomplete; not overwriting %s', bundle_dir)
+            return False
+        os.rename(staging_dir, bundle_dir)
+        staging_dir = None
+        logging.info(
+            'Archived offline slow products for %s: %d calibration tables and %d all-sky files in %s',
+            timestr,
+            len(caltables),
+            len(allsky_files),
+            bundle_dir,
+        )
+        return True
+    except Exception:
+        logging.exception('Failed to archive offline slow products for %s', timestr)
+        return False
+    finally:
+        if staging_dir and os.path.isdir(staging_dir):
+            shutil.rmtree(staging_dir)
+
+
+def find_nearest_offline_slow_products(msname, slow_products_dir,
+                                       warning_seconds=10.0):
+    """Find the nearest complete archived slow product set for one fast MS band."""
+    mstime = utils.get_time_from_name(msname)
+    msfreq_str = utils.get_freqstr_from_name(msname)
+    marker_pattern = os.path.join(
+        slow_products_dir, '*', '*', '*', '*', OFFLINE_SLOW_COMPLETE_MARKER
+    )
+    candidates = []
+
+    for marker in glob.glob(marker_pattern):
+        bundle_dir = os.path.dirname(marker)
+        bundle_timestr = os.path.basename(bundle_dir)
+        if not OFFLINE_SLOW_BUNDLE_RE.match(bundle_timestr):
+            continue
+
+        caltables = sorted(glob.glob(os.path.join(
+            bundle_dir, 'caltables', '*' + msfreq_str + '*.gcal'
+        )))
+        allsky_images = sorted(glob.glob(os.path.join(
+            bundle_dir, 'allsky', '*' + msfreq_str + '*allsky-image.fits'
+        )))
+        allsky_images = [
+            image for image in allsky_images
+            if os.path.isfile(image.replace('-image.fits', '-model.fits'))
+        ]
+        if not caltables or not allsky_images:
+            continue
+
+        bundle_time = utils.get_time_from_name(bundle_timestr)
+        delta_seconds = float((bundle_time - mstime).sec)
+        candidates.append((
+            abs(delta_seconds),
+            delta_seconds > 0,
+            bundle_time.mjd,
+            bundle_timestr,
+            caltables,
+            allsky_images[0],
+            delta_seconds,
+        ))
+
+    if not candidates:
+        logging.warning(
+            'No complete offline slow products found for %s at %s under %s',
+            msfreq_str,
+            mstime.isot,
+            slow_products_dir,
+        )
+        return None
+
+    selected = sorted(candidates, key=lambda item: item[0:3])[0]
+    result = {
+        'timestr': selected[3],
+        'caltables': selected[4],
+        'allsky_image': selected[5],
+        'delta_seconds': selected[6],
+    }
+    message = (
+        'Selected offline slow products for {0} at {1}; fast time {2}, '
+        'offset {3:+.3f} s'
+    ).format(
+        msfreq_str,
+        result['timestr'],
+        mstime.isot,
+        result['delta_seconds'],
+    )
+    if abs(result['delta_seconds']) > float(warning_seconds):
+        logging.warning('%s exceeds the %.3f s warning threshold', message, warning_seconds)
+    else:
+        logging.info(message)
+    return result
+
+
+def stage_offline_slow_products(selection, visdir_work):
+    """Copy archived inputs to a disposable per-band directory for fast processing."""
+    staging_parent = os.path.join(visdir_work, '.offline_slow_products')
+    os.makedirs(staging_parent, exist_ok=True)
+    staging_dir = tempfile.mkdtemp(
+        prefix=selection['timestr'] + '-',
+        dir=staging_parent,
+    )
+
+    try:
+        staged_caltables = []
+        caltable_dir = os.path.join(staging_dir, 'caltables')
+        os.makedirs(caltable_dir)
+        for caltable in selection['caltables']:
+            destination = os.path.join(caltable_dir, os.path.basename(caltable))
+            shutil.copytree(caltable, destination)
+            staged_caltables.append(destination)
+
+        source_image = selection['allsky_image']
+        source_prefix = source_image[:-len('-image.fits')]
+        allsky_dir = os.path.join(staging_dir, 'allsky')
+        os.makedirs(allsky_dir)
+        source_files = sorted(glob.glob(source_prefix + '*.fits'))
+        for source_file in source_files:
+            shutil.copy2(source_file, allsky_dir)
+        staged_prefix = os.path.join(allsky_dir, os.path.basename(source_prefix))
+
+        return staged_caltables, staged_prefix, staging_dir
+    except Exception:
+        shutil.rmtree(staging_dir)
+        raise
     
 
 def check_fast_ms(msname):
@@ -190,7 +395,8 @@ def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_p
                 num_apcal=1, caltable_folder=None, logger_file=None, visdir_slfcaled=None, 
                 refant='283',
                 flagdir=None, delete_allsky=False, actively_rm_ms=True, stokes='I', manual_flagging_ants=None,
-                average_fast=True):
+                average_fast=True, operation_mode='realtime', slow_products_dir=None,
+                slow_products_warn_seconds=10.0):
     
     try:
         msmd.open(msfile)
@@ -232,8 +438,30 @@ def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_p
     imagename = os.path.basename(msfile)[:-3]+'_sun_selfcal'
     
     fast_vis=check_fast_ms(msfile)
+    offline_stage_dir = None
+    offline_sky_image = None
     if not do_selfcal:
-        gaintables = get_selfcal_table_to_apply(msfile,caltable_folder)
+        if fast_vis and offline_slow_products_enabled(operation_mode, slow_products_dir):
+            selection = find_nearest_offline_slow_products(
+                msfile,
+                slow_products_dir,
+                warning_seconds=slow_products_warn_seconds,
+            )
+            if selection is None:
+                gaintables = []
+            else:
+                try:
+                    gaintables, offline_sky_image, offline_stage_dir = \
+                        stage_offline_slow_products(selection, os.path.dirname(msfile))
+                except Exception:
+                    logging.exception('Failed to stage offline slow products for %s', msfile)
+                    gaintables = []
+                    offline_sky_image = None
+                    if offline_stage_dir and os.path.isdir(offline_stage_dir):
+                        shutil.rmtree(offline_stage_dir)
+                    offline_stage_dir = None
+        else:
+            gaintables = get_selfcal_table_to_apply(msfile,caltable_folder)
     if len(bcal_tables_) > 0:
         bcal_table = [bcal_tables_[0]]
         print('<<',Time.now().isot,'>>','Found calibration table {0:s}'.format(bcal_table[0]))
@@ -245,11 +473,16 @@ def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_p
         
         fast_vis_image_model_subtraction=False
         sky_image=None
-        prev_allsky_img=get_allsky_image_to_use(msfile,os.path.dirname(msfile).replace('fast_working','slow_working'))
-        if len(prev_allsky_img)!=0 and fast_vis:
+        if offline_sky_image is not None and fast_vis:
             fast_vis_image_model_subtraction=True
-            sky_image=prev_allsky_img[0].split('-image')[0]
+            sky_image=offline_sky_image
             logging.debug("will use "+sky_image)
+        elif not offline_slow_products_enabled(operation_mode, slow_products_dir):
+            prev_allsky_img=get_allsky_image_to_use(msfile,os.path.dirname(msfile).replace('fast_working','slow_working'))
+            if len(prev_allsky_img)!=0 and fast_vis:
+                fast_vis_image_model_subtraction=True
+                sky_image=prev_allsky_img[0].split('-image')[0]
+                logging.debug("will use "+sky_image)
         
         try:
             outms, tmp = sp.image_ms_quick(msfile, calib_ms=None, bcal=bcal_table, do_selfcal=do_selfcal,\
@@ -278,6 +511,9 @@ def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_p
             fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
             logging.error(exc_type, fname, exc_tb.tb_lineno)
             return -1
+        finally:
+            if offline_stage_dir and os.path.isdir(offline_stage_dir):
+                shutil.rmtree(offline_stage_dir)
     elif len(msfile_cal_) > 0:
         msfile_cal = msfile_cal_[0]
         logging.warning("No selfcal tables will be applied here. You cannot have possibly"+\
@@ -294,7 +530,12 @@ def run_calib(msfile, msfiles_cal=None, bcal_tables=None, do_selfcal=True, num_p
         except Exception as e:
             logging.error(e)
             return -1
+        finally:
+            if offline_stage_dir and os.path.isdir(offline_stage_dir):
+                shutil.rmtree(offline_stage_dir)
     else:
+        if offline_stage_dir and os.path.isdir(offline_stage_dir):
+            shutil.rmtree(offline_stage_dir)
         print('<<',Time.now().isot,'>>','No night time ms or caltable available for {0:s}. Skip...'.format(msfile))
         return -1
 
@@ -999,6 +1240,7 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
             calib_file = '20240117_145752',
             delete_working_ms=True, delete_working_fits=True, do_refra=True, overbright=2e6, save_selfcaltab=False,
             slowfast='slow', do_imaging=True, delete_allsky=False, save_allsky=False, average_fast=True,
+            operation_mode='realtime', slow_products_dir=None, slow_products_warn_seconds=10.0,
             bands = ['32MHz', '36MHz', '41MHz', '46MHz', '50MHz', '55MHz', '59MHz', '64MHz', '69MHz', '73MHz', '78MHz', '82MHz'],
             clear_old_files=True, clear_older_than=45, actively_rm_ms=True, leakage_database='/lustre/msurajit/leakage_database.db'):
     """
@@ -1032,6 +1274,11 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
         False, preserve and image each native 0.1 s integration
     :param delete_allsky: if True, delete the allsky image after each run. Otherwise keep the latest frame. 
     :param save_allsky: if True, save the allsky image FITS file into save_dir + 'allsky/'
+    :param operation_mode: realtime preserves the rolling temporary cache;
+        offline enables persistent slow-product bundles when slow_products_dir is set
+    :param slow_products_dir: persistent slow-product bundle root used by offline mode
+    :param slow_products_warn_seconds: warn when the nearest slow products differ
+        from a fast visibility timestamp by more than this many seconds
     """
 
     time_begin = timeit.default_timer() 
@@ -1040,6 +1287,29 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
 
     if slowfast.lower() != 'slow' and slowfast.lower() != 'fast':
         print("slowfast needs to be either 'slow' or 'fast'. Abort")
+        return False
+
+    operation_mode = operation_mode.lower()
+    if operation_mode not in ('realtime', 'offline'):
+        logging.error("operation_mode needs to be either 'realtime' or 'offline'. Abort")
+        return False
+    if float(slow_products_warn_seconds) < 0:
+        logging.error('slow_products_warn_seconds must be non-negative. Abort')
+        return False
+    use_offline_products = offline_slow_products_enabled(
+        operation_mode, slow_products_dir
+    )
+    if operation_mode == 'offline' and not slow_products_dir:
+        logging.warning(
+            'Offline mode requested without --slow_products_dir; '
+            'falling back to the realtime rolling slow-product cache.'
+        )
+    if use_offline_products and slowfast.lower() == 'slow' and \
+            save_selfcaltab != save_allsky:
+        logging.error(
+            'Persistent offline slow products require both --save_allsky and '
+            '--save_selfcaltab, or neither. Abort.'
+        )
         return False
 
     if lustre:
@@ -1192,7 +1462,13 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
         prev_allsky_imgs = glob.glob(os.path.join(visdir_work,'*_allsky-image.fits'))
         
                 
-        if save_selfcaltab and slowfast.lower()=='slow':
+        if use_offline_products and slowfast.lower() == 'slow':
+            logging.debug(
+                'Offline self-calibration archiving is deferred until imaging '
+                'for %s completes successfully.',
+                timestr,
+            )
+        elif save_selfcaltab and slowfast.lower()=='slow':
 
             if len(prev_calfiles) > 0:
                 logging.info('Saving gain tables to '+caltabarchive)
@@ -1243,7 +1519,9 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
                     refant=refant,
                     num_phase_cal=num_phase_cal, num_apcal=num_apcal, logger_file=logger_file, caltable_folder=gaintable_folder, 
                     visdir_slfcaled=visdir_slfcaled, flagdir=flagdir, delete_allsky=delete_allsky, actively_rm_ms=actively_rm_ms,
-                    stokes=stokes, slowfast=slowfast, average_fast=average_fast)
+                    stokes=stokes, slowfast=slowfast, average_fast=average_fast,
+                    operation_mode=operation_mode, slow_products_dir=slow_products_dir,
+                    slow_products_warn_seconds=slow_products_warn_seconds)
 
             if slowfast.lower()=='slow':
                 timeout = 800.
@@ -1262,7 +1540,7 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
             for file1 in msfiles0_name:
                 timestr1 = utils.get_timestr_from_name(file1)
                 freqstr=utils.get_freqstr_from_name(file1)
-                if save_allsky and slowfast.lower()=='slow':
+                if save_allsky and slowfast.lower()=='slow' and not use_offline_products:
                     allsky_dir_fits_sub = allsky_dir_fits + '/'+ timestr1[0:4]+'/'+timestr1[4:6]+'/'+timestr1[6:8]+'/'
                     if not os.path.exists(allsky_dir_fits_sub):
                         os.makedirs(allsky_dir_fits_sub)
@@ -1500,6 +1778,23 @@ def pipeline_quick(image_time=Time.now() - TimeDelta(20., format='sec'), server=
 
                     synoptic_image=os.path.join(fig_mfs_dir_sub_synop, figname_synop)    
                     os.system('cp '+ figname_to_copy + ' ' + synoptic_image)   
+
+                    if use_offline_products and slowfast.lower() == 'slow' and \
+                            (save_selfcaltab or save_allsky):
+                        archive_success = archive_offline_slow_products(
+                            timestr,
+                            gaintable_folder,
+                            visdir_work,
+                            slow_products_dir,
+                            save_selfcaltab=save_selfcaltab,
+                            save_allsky=save_allsky,
+                        )
+                        if not archive_success:
+                            logging.warning(
+                                'Imaging completed, but offline slow products '
+                                'for %s were not archived.',
+                                timestr,
+                            )
                     
                     if delete_working_fits:
                         os.system('rm -rf '+imagedir_allch + '*')
@@ -1949,9 +2244,7 @@ def do_refraction_correction(fitsfiles, overbright, refrafile, datedir, imagedir
         return None, False
 
 
-import os
 import time
-import shutil
 
 def remove_old_items(directory=".", minutes=45):
     """
@@ -1976,7 +2269,8 @@ def remove_old_items(directory=".", minutes=45):
 
 def run_pipeline(time_start=Time.now(), time_end=None, time_interval=600., delay_from_now=180., do_selfcal=True, num_phase_cal=1, num_apcal=0, 
         server=None, lustre=True, file_path='slow', multinode=True, slurmmanaged=True, taskids='0123456789', delete_ms_slfcaled=True, 
-        slowfast='slow', average_fast=True,
+        slowfast='slow', average_fast=True, operation_mode='realtime',
+        slow_products_dir=None, slow_products_warn_seconds=10.0,
         logger_dir = '/lustre/solarpipe/realtime_pipeline/logs/', logger_prefix='solar_realtime_pipeline', logger_level=20,
         #proc_dir = '/fast/solarpipe/realtime_pipeline/',
         proc_dir_mem = '/dev/shm/srtmp/', proc_dir = '/fast/solarpipe/realtime_pipeline/',
@@ -2010,6 +2304,10 @@ def run_pipeline(time_start=Time.now(), time_end=None, time_interval=600., delay
     :param slowfast: specify slow or fast visibility data to process
     :param average_fast: average fast visibilities to 10 s when True; when
         False, preserve and image each native 0.1 s integration
+    :param operation_mode: realtime uses the rolling in-memory slow-product
+        cache; offline uses persistent bundles when slow_products_dir is set
+    :param slow_products_dir: root of persistent offline slow-product bundles
+    :param slow_products_warn_seconds: warning threshold for slow/fast time matching
     :param delay_from_now: delay of the newest time to process compared to now.
     :param delete_ms_slfcaled: whether or not to delete the self-calibrated measurement sets.
     :param multinode: if True, will delay the start time by the node
@@ -2153,6 +2451,8 @@ def run_pipeline(time_start=Time.now(), time_end=None, time_interval=600., delay
         
         res = pipeline_quick(time_start, do_selfcal=do_selfcal, num_phase_cal=num_phase_cal, num_apcal=num_apcal, 
                             server=server, lustre=lustre, file_path=file_path, slowfast=slowfast, average_fast=average_fast, delete_ms_slfcaled=delete_ms_slfcaled,
+                            operation_mode=operation_mode, slow_products_dir=slow_products_dir,
+                            slow_products_warn_seconds=slow_products_warn_seconds,
                             logger_file=logger_file, proc_dir=proc_dir,  proc_dir_mem=proc_dir_mem, save_dir=save_dir, calib_dir=calib_dir, 
                             calib_file=calib_file, delete_working_ms=delete_working_ms,
                             delete_working_fits=delete_working_fits, do_refra=do_refra,
@@ -2285,6 +2585,30 @@ if __name__=='__main__':
     parser.add_argument('--nonstop', default=False, help='If set, the script will be run without stopping', action='store_true')
     parser.add_argument('--sleep_time', default=0.0, help='Process will sleep for these seconds before doing anything')
     parser.add_argument('--slowfast', default='slow', help='Specify slow or fast visibility data to be processed')
+    parser.add_argument(
+        '--operation_mode',
+        choices=['realtime', 'offline'],
+        default='realtime',
+        help=(
+            'Realtime keeps the rolling temporary slow-product cache. Offline '
+            'uses persistent slow products when --slow_products_dir is supplied.'
+        ),
+    )
+    parser.add_argument(
+        '--slow_products_dir',
+        default=None,
+        help=(
+            'Persistent slow-product bundle root for offline slow archiving and '
+            'offline fast lookup. Without this option, offline mode falls back '
+            'to realtime slow-product handling.'
+        ),
+    )
+    parser.add_argument(
+        '--slow_products_warn_seconds',
+        default=10.0,
+        type=float,
+        help='Warn when selected slow products differ from the fast timestamp by more than this many seconds (default: 10).',
+    )
     average_fast_group = parser.add_mutually_exclusive_group()
     average_fast_group.add_argument(
         '--average_fast',
@@ -2343,6 +2667,8 @@ if __name__=='__main__':
             do_refra=args.do_refra, multinode= (not args.singlenode), delete_working_ms=(not args.keep_working_ms), 
             delete_working_fits=(not args.keep_working_fits), save_allsky=args.save_allsky, beam_fit_size=args.bmfit_sz, briggs=args.briggs,
             do_selfcal=do_selfcal, do_imaging=(not args.no_imaging), bands=args.bands, slowfast=args.slowfast, average_fast=args.average_fast, 
+            operation_mode=args.operation_mode, slow_products_dir=args.slow_products_dir,
+            slow_products_warn_seconds=args.slow_products_warn_seconds,
             stop_at_sunset=(not args.nonstop),
             do_daily_refracorr=(not args.no_refracorr), slurm_kill_after_sunset=args.slurm_kill_after_sunset, 
             save_selfcaltab=args.save_selfcaltab, actively_rm_ms=(not args.no_actively_rm_ms), use_jpl_ephem=args.use_jpl_ephem, stokes=args.stokes)
